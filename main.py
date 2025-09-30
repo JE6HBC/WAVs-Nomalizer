@@ -11,6 +11,8 @@ from PyQt6.QtWidgets import (
     QFileDialog, QComboBox, QProgressBar, QMessageBox, QSpinBox, QFormLayout
 )
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
+import numpy as np
+import pyloudnorm as lk
 from pydub import AudioSegment
 from pydub.effects import compress_dynamic_range
 
@@ -72,21 +74,40 @@ def process_single_file(file_path, output_dir, output_format):
     成功した場合は出力パスを、失敗した場合はエラーメッセージを返す。
     """
     try:
+        # 1. 音声ファイルを読み込み、コンプレッサーを適用
         audio = AudioSegment.from_file(file_path)
         compressed_audio = compress_dynamic_range(
             audio, threshold=-20.0, ratio=4.0, attack=5.0, release=50.0
         )
-        normalized_audio = compressed_audio.normalize()
 
+        # 2. pyloudnormのためにオーディオデータをNumpy配列に変換
+        data = np.array(compressed_audio.get_array_of_samples(), dtype=np.float32)
+
+        # 3. ラウドネスを測定
+        meter = lk.Meter(compressed_audio.frame_rate)
+        loudness = meter.integrated_loudness(data)
+
+        # 4. 目標ラウドネス(-18.0 LUFS)に合わせてノーマライズ
+        # この値は、音声がクリアに聞こえ、かつピーククリッピングのリスクが低い業界標準の一つ
+        target_loudness = -18.0
+        normalized_audio = lk.normalize.loudness(data, loudness, target_loudness)
+
+        # 5. pydub形式にデータを戻す
+        # 32-bit floatから16-bit intへ変換
+        samples = (normalized_audio * (2**15)).astype(np.int16)
+        final_audio = compressed_audio._spawn(samples.tobytes())
+
+
+        # 6. ファイルをエクスポート
         base_name = os.path.basename(file_path)
         file_name, _ = os.path.splitext(base_name)
 
         if output_format == 'wav':
             output_path = os.path.join(output_dir, f"{file_name}.wav")
-            normalized_audio.export(output_path, format="wav", parameters=["-acodec", "pcm_s16le"])
+            final_audio.export(output_path, format="wav", parameters=["-acodec", "pcm_s16le"])
         else:  # mp3
             output_path = os.path.join(output_dir, f"{file_name}.mp3")
-            normalized_audio.export(output_path, format="mp3", bitrate="256k")
+            final_audio.export(output_path, format="mp3", bitrate="256k")
 
         return output_path
     except Exception as e:
@@ -105,7 +126,7 @@ def process_audio_files(file_list, output_dir, output_format, max_workers, progr
     if progress_callback is None:
         progress_bar = tqdm(total=len(file_list), desc="オーディオファイルを処理中", unit="file")
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
         future_to_file = {executor.submit(process_single_file, fp, output_dir, output_format): fp for fp in file_list}
 
         processed_count = 0
