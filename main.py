@@ -11,8 +11,9 @@ from PyQt6.QtWidgets import (
     QFileDialog, QComboBox, QProgressBar, QMessageBox, QSpinBox, QFormLayout
 )
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
+import torch
+import torchaudio
 import numpy as np
-import pyloudnorm as lk
 from pydub import AudioSegment
 from pydub.effects import compress_dynamic_range
 
@@ -68,46 +69,43 @@ def get_audio_files(directory):
 
     return files, None
 
+# --- GPU/CPU Device Detection ---
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"処理デバイス: {DEVICE}")
+
 def process_single_file(file_path, output_dir, output_format):
     """
-    単一の音声ファイルを処理する。
+    単一の音声ファイルをtorchaudioで処理する。GPUが利用可能ならGPUを使用する。
     成功した場合は出力パスを、失敗した場合はエラーメッセージを返す。
     """
     try:
-        # 1. 音声ファイルを読み込み、コンプレッサーを適用
-        audio = AudioSegment.from_file(file_path)
-        compressed_audio = compress_dynamic_range(
-            audio, threshold=-20.0, ratio=4.0, attack=5.0, release=50.0
+        # 1. torchaudioで音声ファイルをロード
+        waveform, sample_rate = torchaudio.load(file_path)
+        waveform = waveform.to(DEVICE)
+
+        # 2. エフェクトチェーンを定義
+        # compand: ダイナミックレンジ圧縮
+        # loudness: 目標ラウドネス(-18 LUFS)にノーマライズ
+        effects = [
+            ["compand", "0.005,0.2", "6:-70,-60,-20", "-5", "-90", "0.2"],
+            ["loudness", "-18.0"],
+        ]
+
+        # 3. エフェクトを適用
+        processed_waveform, processed_sample_rate = torchaudio.sox_effects.apply_effects_tensor(
+            waveform, sample_rate, effects
         )
 
-        # 2. pyloudnormのためにオーディオデータをNumpy配列に変換
-        data = np.array(compressed_audio.get_array_of_samples(), dtype=np.float32)
-
-        # 3. ラウドネスを測定
-        meter = lk.Meter(compressed_audio.frame_rate)
-        loudness = meter.integrated_loudness(data)
-
-        # 4. 目標ラウドネス(-18.0 LUFS)に合わせてノーマライズ
-        # この値は、音声がクリアに聞こえ、かつピーククリッピングのリスクが低い業界標準の一つ
-        target_loudness = -18.0
-        normalized_audio = lk.normalize.loudness(data, loudness, target_loudness)
-
-        # 5. pydub形式にデータを戻す
-        # 32-bit floatから16-bit intへ変換
-        samples = (normalized_audio * (2**15)).astype(np.int16)
-        final_audio = compressed_audio._spawn(samples.tobytes())
-
-
-        # 6. ファイルをエクスポート
+        # 4. ファイルをエクスポート
         base_name = os.path.basename(file_path)
         file_name, _ = os.path.splitext(base_name)
 
         if output_format == 'wav':
             output_path = os.path.join(output_dir, f"{file_name}.wav")
-            final_audio.export(output_path, format="wav", parameters=["-acodec", "pcm_s16le"])
+            torchaudio.save(output_path, processed_waveform.cpu(), processed_sample_rate, format="wav", encoding="PCM_S", bits_per_sample=16)
         else:  # mp3
             output_path = os.path.join(output_dir, f"{file_name}.mp3")
-            final_audio.export(output_path, format="mp3", bitrate="256k")
+            torchaudio.save(output_path, processed_waveform.cpu(), processed_sample_rate, format="mp3", bitrate=256)
 
         return output_path
     except Exception as e:
@@ -279,7 +277,7 @@ class AudioNormalizerGUI(QWidget):
 
         status_text = f"処理中... ({value}/{max_value})"
 
-        if value > 0:
+        if value > 0 and value < max_value:
             elapsed_time = time.time() - self.start_time
             avg_time_per_file = elapsed_time / value
             files_remaining = max_value - value
