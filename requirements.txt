@@ -1,3 +1,7 @@
 PyQt6
 pydub
 tqdm
+numpy
+torch
+torchaudio
+pyloudnorm

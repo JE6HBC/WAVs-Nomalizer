@@ -3,11 +3,18 @@ import os
 import argparse
 import time
 import shutil
+import concurrent.futures
+import multiprocessing
 from tqdm import tqdm
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton, QLabel,
-    QFileDialog, QComboBox, QProgressBar, QMessageBox
+    QFileDialog, QComboBox, QProgressBar, QMessageBox, QSpinBox, QFormLayout
 )
+from PyQt6.QtCore import QObject, QThread, pyqtSignal
+import torch
+import torchaudio
+import numpy as np
+import pyloudnorm as lk
 from pydub import AudioSegment
 from pydub.effects import compress_dynamic_range
 
@@ -63,49 +70,133 @@ def get_audio_files(directory):
 
     return files, None
 
-def process_audio_files(file_list, output_dir, output_format, progress_callback=None):
+def process_single_file(file_path, output_dir, output_format):
     """
-    音声ファイルのリストを処理する。
+    単一の音声ファイルを処理する (ハイブリッドアプローチ)。
+    torchaudioで高速ロードし、pydub/pyloudnormで安定処理する。
+    成功した場合は出力パスを、失敗した場合はエラーメッセージを返す。
+    """
+    try:
+        # 1. torchaudioで高速にファイルをロード
+        waveform, sample_rate = torchaudio.load(file_path)
+
+        # 2. PyTorchテンソルをpydub.AudioSegmentに変換
+        # データを[-1, 1]の範囲から16-bit intに変換
+        samples = (waveform.numpy() * (2**15)).astype(np.int16)
+        # pydubが扱えるようにチャンネルを転置 (channels, samples) -> (samples, channels)
+        if samples.shape[0] == 1: # Mono
+             audio = AudioSegment(
+                samples.tobytes(),
+                frame_rate=sample_rate,
+                sample_width=2, # 16-bit
+                channels=1
+            )
+        else: # Stereo
+            audio = AudioSegment(
+                samples.T.tobytes(),
+                frame_rate=sample_rate,
+                sample_width=2, # 16-bit
+                channels=2
+            )
+
+        # 3. pydubでダイナミックレンジ圧縮
+        compressed_audio = compress_dynamic_range(
+            audio, threshold=-20.0, ratio=4.0, attack=5.0, release=50.0
+        )
+
+        # 4. pyloudnormでラウドネス正規化
+        data = np.array(compressed_audio.get_array_of_samples(), dtype=np.float32)
+        meter = lk.Meter(compressed_audio.frame_rate)
+        loudness = meter.integrated_loudness(data)
+        target_loudness = -18.0
+        normalized_samples_float = lk.normalize.loudness(data, loudness, target_loudness)
+
+        # pydub形式にデータを戻す
+        normalized_samples_int = (normalized_samples_float * (2**15)).astype(np.int16)
+        final_audio = compressed_audio._spawn(normalized_samples_int.tobytes())
+
+        # 5. pydubでファイルをエクスポート
+        base_name = os.path.basename(file_path)
+        file_name, _ = os.path.splitext(base_name)
+
+        if output_format == 'wav':
+            output_path = os.path.join(output_dir, f"{file_name}.wav")
+            final_audio.export(output_path, format="wav", parameters=["-acodec", "pcm_s16le"])
+        else:  # mp3
+            output_path = os.path.join(output_dir, f"{file_name}.mp3")
+            final_audio.export(output_path, format="mp3", bitrate="256k")
+
+        return output_path
+    except Exception as e:
+        return f"ファイル処理中にエラーが発生しました: {file_path}\n{e}"
+
+def process_audio_files(file_list, output_dir, output_format, max_workers, progress_callback=None):
+    """
+    音声ファイルのリストを並列処理する。
     progress_callbackは進捗を報告するための関数(value, max_value)
     """
     os.makedirs(output_dir, exist_ok=True)
+    errors = []
 
-    iterator = tqdm(file_list, desc="Processing audio files", unit="file") if progress_callback is None else file_list
+    # CUIモード用のプログレスバー
+    progress_bar = None
+    if progress_callback is None:
+        progress_bar = tqdm(total=len(file_list), desc="オーディオファイルを処理中", unit="file")
 
-    for i, file_path in enumerate(iterator):
-        try:
-            audio = AudioSegment.from_file(file_path)
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+        future_to_file = {executor.submit(process_single_file, fp, output_dir, output_format): fp for fp in file_list}
 
-            compressed_audio = compress_dynamic_range(
-                audio, threshold=-20.0, ratio=4.0, attack=5.0, release=50.0
-            )
-            normalized_audio = compressed_audio.normalize()
+        processed_count = 0
+        for future in concurrent.futures.as_completed(future_to_file):
+            result = future.result()
+            if "エラー" in result:
+                errors.append(result)
 
-            base_name = os.path.basename(file_path)
-            if output_format == 'wav':
-                output_path = os.path.join(output_dir, f"{os.path.splitext(base_name)[0]}.wav")
-                normalized_audio.export(output_path, format="wav", parameters=["-acodec", "pcm_s16le"])
-            else: # mp3
-                output_path = os.path.join(output_dir, f"{os.path.splitext(base_name)[0]}.mp3")
-                normalized_audio.export(output_path, format="mp3", bitrate="256k")
-        except Exception as e:
-            error_message = f"ファイル処理中にエラーが発生しました: {file_path}\n{e}"
-            if progress_callback is None: # CUI mode
-                print(f"\n{error_message}")
-            return error_message
+            processed_count += 1
+            if progress_callback:
+                progress_callback(processed_count, len(file_list))
+            if progress_bar:
+                progress_bar.update(1)
 
-        if progress_callback:
-            progress_callback(i + 1, len(file_list))
+    if progress_bar:
+        progress_bar.close()
+
+    if errors:
+        # エラーメッセージを結合して返す
+        return "\n".join(errors)
 
     return None # Success
 
 # --- GUI Application ---
 
+class ProcessingWorker(QObject):
+    """バックグラウンドでファイル処理を行うワーカー"""
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal(str) # エラーメッセージまたはNoneを渡す
+
+    def __init__(self, files, output_dir, output_format, max_workers):
+        super().__init__()
+        self.files = files
+        self.output_dir = output_dir
+        self.output_format = output_format
+        self.max_workers = max_workers
+
+    def run(self):
+        """処理を実行する"""
+        error = process_audio_files(
+            self.files,
+            self.output_dir,
+            self.output_format,
+            self.max_workers,
+            self.progress.emit
+        )
+        self.finished.emit(error)
+
 class AudioNormalizerGUI(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('WAVs-Normalizer')
-        self.setGeometry(100, 100, 400, 300)
+        self.setGeometry(100, 100, 450, 350) # Window size adjusted
 
         self.layout = QVBoxLayout()
         self.setLayout(self.layout)
@@ -113,6 +204,8 @@ class AudioNormalizerGUI(QWidget):
         self.input_dir = ''
         self.files_to_process = []
         self.start_time = 0
+        self.processing_thread = None
+        self.worker = None
 
         self.select_folder_button = QPushButton('入力フォルダを選択')
         self.select_folder_button.clicked.connect(self.select_input_folder)
@@ -121,12 +214,21 @@ class AudioNormalizerGUI(QWidget):
         self.status_label = QLabel('フォルダを選択してください。')
         self.layout.addWidget(self.status_label)
 
-        self.format_label = QLabel('出力形式:')
-        self.layout.addWidget(self.format_label)
+        # --- Options Layout ---
+        form_layout = QFormLayout()
 
         self.format_combo = QComboBox()
         self.format_combo.addItems(['WAV 16bit', 'MP3 256kbps'])
-        self.layout.addWidget(self.format_combo)
+        form_layout.addRow('出力形式:', self.format_combo)
+
+        self.worker_spinbox = QSpinBox()
+        self.worker_spinbox.setMinimum(1)
+        self.worker_spinbox.setMaximum(multiprocessing.cpu_count() * 2)
+        self.worker_spinbox.setValue(multiprocessing.cpu_count())
+        form_layout.addRow('並列処理数:', self.worker_spinbox)
+
+        self.layout.addLayout(form_layout)
+        # --- End Options Layout ---
 
         self.process_button = QPushButton('処理開始')
         self.process_button.clicked.connect(self.start_processing)
@@ -153,22 +255,37 @@ class AudioNormalizerGUI(QWidget):
     def start_processing(self):
         self.set_ui_enabled(False)
         output_dir = f"{self.input_dir}-Nomalized"
-        output_format_text = self.format_combo.currentText()
-        output_format = 'wav' if 'WAV' in output_format_text else 'mp3'
+        output_format = 'wav' if 'WAV' in self.format_combo.currentText() else 'mp3'
+        max_workers = self.worker_spinbox.value()
 
         total_files = len(self.files_to_process)
         self.progress_bar.setMaximum(total_files)
         self.progress_bar.setValue(0)
-        self.status_label.setText(f"処理中... (0/{total_files})")
-
+        self.status_label.setText(f"処理開始... (0/{total_files})")
         self.start_time = time.time()
 
-        error = process_audio_files(self.files_to_process, output_dir, output_format, self.update_progress)
+        # Setup and start the background thread
+        self.processing_thread = QThread()
+        self.worker = ProcessingWorker(self.files_to_process, output_dir, output_format, max_workers)
+        self.worker.moveToThread(self.processing_thread)
 
+        self.worker.progress.connect(self.update_progress)
+        self.worker.finished.connect(self.on_processing_finished)
+        self.processing_thread.started.connect(self.worker.run)
+
+        self.processing_thread.start()
+
+    def on_processing_finished(self, error):
+        self.processing_thread.quit()
+        self.processing_thread.wait()
+
+        total_files = len(self.files_to_process)
         if error:
             self.show_message("エラー", error, QMessageBox.Icon.Critical)
+            self.status_label.setText("エラーが発生しました。")
         else:
-            self.status_label.setText(f"処理完了: {total_files}/{total_files} 件")
+            elapsed_time = time.time() - self.start_time
+            self.status_label.setText(f"処理完了: {total_files}/{total_files} 件 (処理時間: {elapsed_time:.2f}秒)")
             self.show_message("完了", "処理が完了しました。", QMessageBox.Icon.Information)
 
         self.reset_ui()
@@ -176,10 +293,11 @@ class AudioNormalizerGUI(QWidget):
     def update_progress(self, value, max_value):
         self.progress_bar.setValue(value)
         self.progress_bar.setMaximum(max_value)
-        elapsed_time = time.time() - self.start_time
+
         status_text = f"処理中... ({value}/{max_value})"
 
         if value > 0 and value < max_value:
+            elapsed_time = time.time() - self.start_time
             avg_time_per_file = elapsed_time / value
             files_remaining = max_value - value
             estimated_remaining_time = avg_time_per_file * files_remaining
@@ -188,17 +306,19 @@ class AudioNormalizerGUI(QWidget):
             status_text += f" - 残り時間: 約{time_str}"
 
         self.status_label.setText(status_text)
-        QApplication.processEvents()
 
     def set_ui_enabled(self, enabled):
         self.select_folder_button.setEnabled(enabled)
         self.format_combo.setEnabled(enabled)
+        self.worker_spinbox.setEnabled(enabled)
         self.process_button.setEnabled(enabled)
 
     def reset_ui(self):
         self.set_ui_enabled(True)
         self.status_label.setText('準備完了。次のフォルダを選択してください。')
         self.process_button.setEnabled(False)
+        self.processing_thread = None
+        self.worker = None
 
     def show_message(self, title, message, icon):
         msg_box = QMessageBox()
@@ -214,6 +334,12 @@ def main():
     parser.add_argument('--no-gui', action='store_true', help="Run in command-line interface mode.")
     parser.add_argument('-i', '--input', dest='input_dir', help="Input directory path (required for CUI).")
     parser.add_argument('-f', '--format', choices=['wav', 'mp3'], default='wav', help="Output format: wav or mp3 (for CUI).")
+    parser.add_argument(
+        '-w', '--workers',
+        type=int,
+        default=multiprocessing.cpu_count(),
+        help=f"Number of parallel worker threads (default: {multiprocessing.cpu_count()})."
+    )
     args = parser.parse_args()
 
     # --- FFmpeg Dependency Check ---
@@ -236,20 +362,29 @@ def main():
         if not args.input_dir:
             parser.error("--input is required for --no-gui mode.")
 
+        print("CUIモードで処理を開始します。")
         print(f"入力フォルダ: {args.input_dir}")
         files, err = get_audio_files(args.input_dir)
         if err:
             print(err)
             sys.exit(1)
 
-        print(f"{len(files)}個の音声ファイルを処理します。")
+        print(f"{len(files)}個の音声ファイルを、{args.workers}個のワーカーで処理します。")
         output_dir = f"{args.input_dir}-Nomalized"
-        error = process_audio_files(files, output_dir, args.format)
+
+        start_time = time.time()
+        error = process_audio_files(files, output_dir, args.format, args.workers)
+        end_time = time.time()
 
         if error:
             print("\n処理がエラーにより中断されました。")
+            print("--- エラー詳細 ---")
+            print(error)
+            print("--- エラー詳細 ---")
         else:
             print("\nすべてのファイルの処理が完了しました。")
+
+        print(f"処理時間: {end_time - start_time:.2f}秒")
     else:
         app = QApplication(sys.argv)
         ex = AudioNormalizerGUI()
